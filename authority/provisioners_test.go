@@ -390,3 +390,22 @@ func Test_isRAProvisioner(t *testing.T) {
 		})
 	}
 }
+
+func TestProvisionerToLinkedca_scepSigner(t *testing.T) {
+	_, err := ProvisionerToLinkedca(&provisioner.SCEP{
+		Type: "SCEP",
+		Name: "scep",
+	})
+	require.NoError(t, err)
+
+	for name, p := range map[string]*provisioner.SCEP{
+		"certificate": {Type: "SCEP", Name: "scep", SignerCertificate: []byte("cert")},
+		"key PEM":     {Type: "SCEP", Name: "scep", SignerKeyPEM: []byte("key")},
+		"key URI":     {Type: "SCEP", Name: "scep", SignerKeyURI: "awskms:key-id=signer"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := ProvisionerToLinkedca(p)
+			require.ErrorContains(t, err, `provisioner "scep": a separate SCEP signer can't be stored in the database yet`)
+		})
+	}
+}

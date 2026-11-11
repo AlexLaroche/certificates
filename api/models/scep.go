@@ -29,6 +29,10 @@ type SCEP struct {
 	DecrypterKeyPEM               []byte               `json:"decrypterKeyPEM"`
 	DecrypterKeyURI               string               `json:"decrypterKey"`
 	DecrypterKeyPassword          string               `json:"decrypterKeyPassword"`
+	SignerCertificate             []byte               `json:"signerCertificate"`
+	SignerKeyPEM                  []byte               `json:"signerKeyPEM"`
+	SignerKeyURI                  string               `json:"signerKey"`
+	SignerKeyPassword             string               `json:"signerKeyPassword"`
 	EncryptionAlgorithmIdentifier int                  `json:"encryptionAlgorithmIdentifier"`
 	Options                       *provisioner.Options `json:"options,omitempty"`
 	Claims                        *provisioner.Claims  `json:"claims,omitempty"`

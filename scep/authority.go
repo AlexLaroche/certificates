@@ -163,7 +163,8 @@ func (a *Authority) GetCACertificates(ctx context.Context) (certs []*x509.Certif
 
 	// if a provisioner specific RSA decrypter is available, it is returned as
 	// the first certificate.
-	if decrypterCertificate, _ := p.GetDecrypter(); decrypterCertificate != nil {
+	decrypterCertificate, _ := p.GetDecrypter()
+	if decrypterCertificate != nil {
 		certs = append(certs, decrypterCertificate)
 	}
 
@@ -171,7 +172,18 @@ func (a *Authority) GetCACertificates(ctx context.Context) (certs []*x509.Certif
 	// exclude it from being added through configuration. This can be useful in
 	// environments where the SCEP client doesn't select the right RSA decrypter
 	// certificate, resulting in the wrong recipient in the PKCS7 message.
-	if p.ShouldIncludeIntermediateInChain() || len(certs) == 0 {
+	includeIntermediates := p.ShouldIncludeIntermediateInChain() || len(certs) == 0
+
+	// if a provisioner specific signer certificate is available, and it isn't
+	// already part of the chain, it's returned after the decrypter certificate,
+	// so that clients can verify the signature on responses.
+	if signerCertificate, _ := p.GetSigner(); signerCertificate != nil &&
+		!signerCertificate.Equal(decrypterCertificate) &&
+		(!includeIntermediates || !containsCertificate(a.intermediates, signerCertificate)) {
+		certs = append(certs, signerCertificate)
+	}
+
+	if includeIntermediates {
 		// TODO(hs): ensure logic is in place that checks the signer is the first
 		// intermediate and that there are no double certificates.
 		certs = append(certs, a.intermediates...)
@@ -184,6 +196,16 @@ func (a *Authority) GetCACertificates(ctx context.Context) (certs []*x509.Certif
 	}
 
 	return certs, nil
+}
+
+// containsCertificate returns whether cert is one of certs.
+func containsCertificate(certs []*x509.Certificate, cert *x509.Certificate) bool {
+	for _, c := range certs {
+		if c.Equal(cert) {
+			return true
+		}
+	}
+	return false
 }
 
 // DecryptPKIEnvelope decrypts an enveloped message

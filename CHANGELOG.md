@@ -31,6 +31,13 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 - Support for ML-DSA (FIPS 204) keys, available when built with Go 1.27 or
   newer. JOSE-based flows (JWK, JWS and JWT tokens) do not support ML-DSA yet.
+- SCEP provisioners accept a separate signer for responses, with
+  `signerCertificate` and either `signerKeyPEM` or `signerKey` (a KMS URI),
+  plus an optional `signerKeyPassword`. Use it when the decrypter key can't
+  also sign, such as an AWS KMS key restricted to decryption, or a FIPS client
+  that refuses a signature from a key used for decryption (#2800). Without a
+  signer, responses are still signed with the decrypter key. The separate
+  signer is only supported in `ca.json` for now.
 
 ### Changed
 

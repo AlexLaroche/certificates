@@ -43,11 +43,22 @@ type SCEP struct {
 	// MinimumPublicKeyLength is the minimum length for public keys in CSRs
 	MinimumPublicKeyLength int `json:"minimumPublicKeyLength,omitempty"`
 
-	// TODO(hs): also support a separate signer configuration?
 	DecrypterCertificate []byte `json:"decrypterCertificate,omitempty"`
 	DecrypterKeyPEM      []byte `json:"decrypterKeyPEM,omitempty"`
 	DecrypterKeyURI      string `json:"decrypterKey,omitempty"`
 	DecrypterKeyPassword string `json:"decrypterKeyPassword,omitempty"`
+
+	// SignerCertificate, SignerKeyPEM, SignerKeyURI and SignerKeyPassword
+	// configure the key and certificate used to sign SCEP responses,
+	// separately from the decrypter. They're needed when the decrypter key
+	// can't also sign: a KMS key restricted to decryption, or a FIPS client
+	// that refuses a signature from a key also used for decryption. When no
+	// signer is configured, responses are signed with the decrypter key if
+	// one is configured, or with the CA intermediate otherwise.
+	SignerCertificate []byte `json:"signerCertificate,omitempty"`
+	SignerKeyPEM      []byte `json:"signerKeyPEM,omitempty"`
+	SignerKeyURI      string `json:"signerKey,omitempty"`
+	SignerKeyPassword string `json:"signerKeyPassword,omitempty"`
 
 	// Numerical identifier for the ContentEncryptionAlgorithm as defined in github.com/mozilla-services/pkcs7
 	// at https://github.com/mozilla-services/pkcs7/blob/33d05740a3526e382af6395d3513e73d4e66d1cb/encrypt.go#L63
@@ -314,8 +325,9 @@ func (s *SCEP) Init(config Config) (err error) {
 		}); err != nil {
 			return fmt.Errorf("failed creating decrypter: %w", err)
 		}
+		// Without a separate signer, the decrypter key also signs responses.
 		if s.signer, err = s.keyManager.CreateSigner(&kmsapi.CreateSignerRequest{
-			SigningKeyPEM:    s.DecrypterKeyPEM, // TODO(hs): support distinct signer key in the future?
+			SigningKeyPEM:    s.DecrypterKeyPEM,
 			Password:         []byte(s.DecrypterKeyPassword),
 			PasswordPrompter: kmsapi.NonInteractivePasswordPrompter,
 		}); err != nil {
@@ -350,8 +362,8 @@ func (s *SCEP) Init(config Config) (err error) {
 			s.keyManager = scepKeyManager
 		}
 
-		// Create decrypter and signer with the same key:
-		// TODO(hs): support distinct signer key in the future?
+		// Create decrypter and signer with the same key. A separate signer,
+		// if configured, replaces the signer below.
 		if s.decrypter, err = s.keyManager.CreateDecrypter(&kmsapi.CreateDecrypterRequest{
 			DecryptionKey:    s.DecrypterKeyURI,
 			Password:         []byte(s.DecrypterKeyPassword),
@@ -399,6 +411,11 @@ func (s *SCEP) Init(config Config) (err error) {
 		if !decrypterPublicKey.Equal(s.decrypterCertificate.PublicKey) {
 			return errors.New("mismatch between decrypter certificate and decrypter public keys")
 		}
+	}
+
+	// A separate signer, if configured, replaces the decrypter key as signer.
+	if err := s.initSigner(config); err != nil {
+		return err
 	}
 
 	// TODO: add other, SCEP specific, options?
@@ -522,4 +539,93 @@ func (s *SCEP) GetDecrypter() (*x509.Certificate, crypto.Decrypter) {
 // corresponding to the private key.
 func (s *SCEP) GetSigner() (*x509.Certificate, crypto.Signer) {
 	return s.signerCertificate, s.signer
+}
+
+// hasSigner returns whether a separate signer is configured.
+func (s *SCEP) hasSigner() bool {
+	return len(s.SignerCertificate) > 0 || len(s.SignerKeyPEM) > 0 || s.SignerKeyURI != ""
+}
+
+// initSigner creates the separate signer used to sign SCEP responses,
+// if one is configured. It requires exactly one of SignerKeyPEM and
+// SignerKeyURI, and a SignerCertificate matching that key.
+func (s *SCEP) initSigner(config Config) error {
+	if !s.hasSigner() {
+		return nil
+	}
+
+	switch {
+	case len(s.SignerKeyPEM) > 0 && s.SignerKeyURI != "":
+		return errors.New("signerKeyPEM and signerKey are mutually exclusive")
+	case len(s.SignerKeyPEM) == 0 && s.SignerKeyURI == "":
+		return fmt.Errorf("provisioner %q has a signer certificate but no signer key", s.Name)
+	case len(s.SignerCertificate) == 0:
+		return fmt.Errorf("provisioner %q does not have a signer certificate set", s.Name)
+	}
+
+	block, rest := pem.Decode(s.SignerCertificate)
+	if len(rest) > 0 {
+		return errors.New("failed parsing signer certificate: trailing data")
+	}
+	if block == nil {
+		return errors.New("failed parsing signer certificate: no PEM block found")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("failed parsing signer certificate: %w", err)
+	}
+
+	var (
+		km  kmsapi.KeyManager
+		req = &kmsapi.CreateSignerRequest{
+			Password:         []byte(s.SignerKeyPassword),
+			PasswordPrompter: kmsapi.NonInteractivePasswordPrompter,
+		}
+	)
+	if len(s.SignerKeyPEM) > 0 {
+		block, rest := pem.Decode(s.SignerKeyPEM)
+		if len(rest) > 0 {
+			return errors.New("failed parsing signer key: trailing data")
+		}
+		if block == nil {
+			return errors.New("failed parsing signer key: no PEM block found")
+		}
+		if km, err = kms.New(context.Background(), kms.Options{Type: kmsapi.SoftKMS}); err != nil {
+			return fmt.Errorf("failed initializing kms: %w", err)
+		}
+		req.SigningKeyPEM = s.SignerKeyPEM
+	} else {
+		kmsType, err := kmsapi.TypeOf(s.SignerKeyURI)
+		if err != nil {
+			return fmt.Errorf("failed parsing signer key: %w", err)
+		}
+		if config.SCEPKeyManager != nil {
+			km = config.SCEPKeyManager
+		} else {
+			if kmsType == kmsapi.DefaultKMS {
+				kmsType = kmsapi.SoftKMS
+			}
+			if km, err = kms.New(context.Background(), kms.Options{
+				Type: kmsType,
+				URI:  s.SignerKeyURI,
+			}); err != nil {
+				return fmt.Errorf("failed initializing kms: %w", err)
+			}
+		}
+		req.SigningKey = s.SignerKeyURI
+	}
+
+	signer, err := km.CreateSigner(req)
+	if err != nil {
+		return fmt.Errorf("failed creating signer: %w", err)
+	}
+
+	pub, ok := signer.Public().(interface{ Equal(crypto.PublicKey) bool })
+	if !ok || !pub.Equal(cert.PublicKey) {
+		return errors.New("mismatch between signer certificate and signer public keys")
+	}
+
+	s.signer = signer
+	s.signerCertificate = cert
+	return nil
 }

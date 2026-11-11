@@ -1247,6 +1247,11 @@ func ProvisionerToLinkedca(p provisioner.Interface) (*linkedca.Provisioner, erro
 			Claims: claimsToLinkedca(p.Claims),
 		}, nil
 	case *provisioner.SCEP:
+		// linkedca can't store a separate SCEP signer yet. Fail instead of
+		// dropping it, which would sign responses with the decrypter key.
+		if len(p.SignerCertificate) > 0 || len(p.SignerKeyPEM) > 0 || p.SignerKeyURI != "" {
+			return nil, fmt.Errorf("provisioner %q: a separate SCEP signer can't be stored in the database yet", p.GetName())
+		}
 		x509Template, sshTemplate, webhooks, err := provisionerOptionsToLinkedca(p.Options)
 		if err != nil {
 			return nil, err

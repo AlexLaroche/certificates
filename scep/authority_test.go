@@ -87,6 +87,9 @@ type signAuthority struct {
 	ca       *minica.CA
 	webhooks []*provisioner.Webhook
 	template string
+	// optional separate signer for the provisioner
+	signerCertificate []byte
+	signerKeyPEM      []byte
 }
 
 func (s *signAuthority) SignWithContext(ctx context.Context, cr *x509.CertificateRequest, opts provisioner.SignOptions, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error) {
@@ -120,6 +123,8 @@ func (s *signAuthority) LoadProvisionerByName(string) (provisioner.Interface, er
 			Type:  "RSA PRIVATE KEY",
 			Bytes: x509.MarshalPKCS1PrivateKey(s.ca.Signer.(*rsa.PrivateKey)),
 		}),
+		SignerCertificate: s.signerCertificate,
+		SignerKeyPEM:      s.signerKeyPEM,
 		Options: &provisioner.Options{
 			Webhooks: s.webhooks,
 			X509: &provisioner.X509Options{
@@ -246,4 +251,137 @@ func TestAuthority_SignCSR(t *testing.T) {
 			tt.validate(t, got)
 		})
 	}
+}
+
+// chainProvisioner is a Provisioner returning fixed decrypter and
+// signer certificates, for testing GetCACertificates.
+type chainProvisioner struct {
+	Provisioner
+	decrypterCertificate *x509.Certificate
+	signerCertificate    *x509.Certificate
+	includeIntermediate  bool
+	includeRoot          bool
+}
+
+func (p *chainProvisioner) GetDecrypter() (*x509.Certificate, crypto.Decrypter) {
+	return p.decrypterCertificate, nil
+}
+
+func (p *chainProvisioner) GetSigner() (*x509.Certificate, crypto.Signer) {
+	return p.signerCertificate, nil
+}
+
+func (p *chainProvisioner) ShouldIncludeIntermediateInChain() bool { return p.includeIntermediate }
+func (p *chainProvisioner) ShouldIncludeRootInChain() bool         { return p.includeRoot }
+
+func TestAuthority_GetCACertificates(t *testing.T) {
+	ca, err := minica.New()
+	require.NoError(t, err)
+	newCert := func(cn string) *x509.Certificate {
+		s, err := keyutil.GenerateSigner("RSA", "", 2048)
+		require.NoError(t, err)
+		cert, err := ca.Sign(&x509.Certificate{
+			Subject:   pkix.Name{CommonName: cn},
+			PublicKey: s.Public(),
+		})
+		require.NoError(t, err)
+		return cert
+	}
+	decrypter := newCert("decrypter")
+	signer := newCert("signer")
+
+	a := &Authority{
+		roots:         []*x509.Certificate{ca.Root},
+		intermediates: []*x509.Certificate{ca.Intermediate},
+	}
+
+	tests := []struct {
+		name string
+		p    *chainProvisioner
+		want []*x509.Certificate
+	}{
+		{"intermediate only", &chainProvisioner{includeIntermediate: true},
+			[]*x509.Certificate{ca.Intermediate}},
+		{"decrypter signs", &chainProvisioner{decrypterCertificate: decrypter, signerCertificate: decrypter, includeIntermediate: true},
+			[]*x509.Certificate{decrypter, ca.Intermediate}},
+		{"separate signer", &chainProvisioner{decrypterCertificate: decrypter, signerCertificate: signer, includeIntermediate: true},
+			[]*x509.Certificate{decrypter, signer, ca.Intermediate}},
+		{"separate signer with root", &chainProvisioner{decrypterCertificate: decrypter, signerCertificate: signer, includeIntermediate: true, includeRoot: true},
+			[]*x509.Certificate{decrypter, signer, ca.Intermediate, ca.Root}},
+		{"separate signer without intermediate", &chainProvisioner{decrypterCertificate: decrypter, signerCertificate: signer},
+			[]*x509.Certificate{decrypter, signer}},
+		{"intermediate signer", &chainProvisioner{decrypterCertificate: decrypter, signerCertificate: ca.Intermediate, includeIntermediate: true},
+			[]*x509.Certificate{decrypter, ca.Intermediate}},
+		{"intermediate signer without intermediate", &chainProvisioner{decrypterCertificate: decrypter, signerCertificate: ca.Intermediate},
+			[]*x509.Certificate{decrypter, ca.Intermediate}},
+		{"separate signer without decrypter", &chainProvisioner{signerCertificate: signer},
+			[]*x509.Certificate{signer, ca.Intermediate}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.WithValue(context.Background(), provisionerKey{}, Provisioner(tt.p))
+			got, err := a.GetCACertificates(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestAuthority_SignCSR_separateSigner(t *testing.T) {
+	ca, err := minica.New(minica.WithGetSignerFunc(func() (crypto.Signer, error) {
+		return rsa.GenerateKey(rand.Reader, 2048)
+	}))
+	require.NoError(t, err)
+
+	signerKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	signerCert, err := ca.Sign(&x509.Certificate{
+		Subject:   pkix.Name{CommonName: "SCEP signer"},
+		PublicKey: signerKey.Public(),
+	})
+	require.NoError(t, err)
+
+	sa := &signAuthority{
+		ca:                ca,
+		signerCertificate: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: signerCert.Raw}),
+		signerKeyPEM:      pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(signerKey)}),
+	}
+	a, err := New(sa, Options{
+		Roots:                []*x509.Certificate{ca.Root},
+		Intermediates:        []*x509.Certificate{ca.Intermediate},
+		SignerCert:           ca.Intermediate,
+		Signer:               ca.Signer,
+		Decrypter:            ca.Signer.(*rsa.PrivateKey),
+		DecrypterCert:        ca.Intermediate,
+		SCEPProvisionerNames: []string{"scep"},
+	})
+	require.NoError(t, err)
+	p, err := a.LoadProvisionerByName("scep")
+	require.NoError(t, err)
+	ctx := NewProvisionerContext(context.Background(), p.(*provisioner.SCEP))
+
+	csrSigner, err := keyutil.GenerateDefaultSigner()
+	require.NoError(t, err)
+	csr, err := x509util.CreateCertificateRequest("jane@example.com", nil, csrSigner)
+	require.NoError(t, err)
+
+	msg := &PKIMessage{
+		TransactionID: "tx",
+		CSRReqMessage: &scep.CSRReqMessage{CSR: csr},
+		P7:            &pkcs7.PKCS7{Certificates: []*x509.Certificate{ca.Intermediate}},
+	}
+	got, err := a.SignCSR(ctx, csr, msg)
+	require.NoError(t, err)
+
+	p7, err := pkcs7.Parse(got.Raw)
+	require.NoError(t, err)
+	require.NoError(t, p7.Verify())
+	assert.Equal(t, signerCert, p7.GetOnlySigner())
+
+	failure, err := a.CreateFailureResponse(ctx, csr, msg, FailInfoName(scep.BadRequest), "bad request")
+	require.NoError(t, err)
+	p7, err = pkcs7.Parse(failure.Raw)
+	require.NoError(t, err)
+	require.NoError(t, p7.Verify())
+	assert.Equal(t, signerCert, p7.GetOnlySigner())
 }

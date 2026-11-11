@@ -3,6 +3,8 @@ package provisioner
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -550,6 +552,32 @@ func TestSCEP_Init(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, keyPEM, 0600))
 	require.NoError(t, os.WriteFile(pathNoPassword, keyPEMNoPassword, 0600))
 
+	signerKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	signerCert, err := ca.Sign(&x509.Certificate{
+		Subject:   pkix.Name{CommonName: "SCEP signer"},
+		PublicKey: signerKey.Public(),
+	})
+	require.NoError(t, err)
+	signerCertPEM := pem.EncodeToMemory(&pem.Block{
+		Type: "CERTIFICATE", Bytes: signerCert.Raw,
+	})
+	signerKeyPEM := serialize(signerKey, "password")
+	signerPath := filepath.Join(tmp, "signer.key")
+	require.NoError(t, os.WriteFile(signerPath, serialize(signerKey, ""), 0600))
+
+	ecSignerKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	ecSignerCert, err := ca.Sign(&x509.Certificate{
+		Subject:   pkix.Name{CommonName: "SCEP EC signer"},
+		PublicKey: ecSignerKey.Public(),
+	})
+	require.NoError(t, err)
+	ecSignerCertPEM := pem.EncodeToMemory(&pem.Block{
+		Type: "CERTIFICATE", Bytes: ecSignerCert.Raw,
+	})
+	ecSignerKeyPEM := serialize(ecSignerKey, "")
+
 	type args struct {
 		config Config
 	}
@@ -619,6 +647,113 @@ func TestSCEP_Init(t *testing.T) {
 			DecrypterKeyPassword:          "",
 			EncryptionAlgorithmIdentifier: 0,
 		}, args{Config{Claims: globalProvisionerClaims}}, false},
+		{"ok separate signer", &SCEP{
+			Type:                 "SCEP",
+			Name:                 "scep",
+			DecrypterCertificate: certPEM,
+			DecrypterKeyPEM:      keyPEM,
+			DecrypterKeyPassword: "password",
+			SignerCertificate:    signerCertPEM,
+			SignerKeyPEM:         signerKeyPEM,
+			SignerKeyPassword:    "password",
+		}, args{Config{Claims: globalProvisionerClaims}}, false},
+		{"ok separate signer with uri", &SCEP{
+			Type:                 "SCEP",
+			Name:                 "scep",
+			DecrypterCertificate: certPEM,
+			DecrypterKeyURI:      "softkms:path=" + path,
+			DecrypterKeyPassword: "password",
+			SignerCertificate:    signerCertPEM,
+			SignerKeyURI:         "softkms:path=" + signerPath,
+		}, args{Config{Claims: globalProvisionerClaims}}, false},
+		{"ok separate signer with SCEPKeyManager", &SCEP{
+			Type:                 "SCEP",
+			Name:                 "scep",
+			DecrypterCertificate: certPEM,
+			DecrypterKeyURI:      "softkms:path=" + pathNoPassword,
+			SignerCertificate:    signerCertPEM,
+			SignerKeyURI:         "softkms:path=" + signerPath,
+		}, args{Config{Claims: globalProvisionerClaims, SCEPKeyManager: &softkms.SoftKMS{}}}, false},
+		{"ok separate signer without decrypter", &SCEP{
+			Type:              "SCEP",
+			Name:              "scep",
+			SignerCertificate: signerCertPEM,
+			SignerKeyPEM:      signerKeyPEM,
+			SignerKeyPassword: "password",
+		}, args{Config{Claims: globalProvisionerClaims}}, false},
+		{"ok separate EC signer", &SCEP{
+			Type:                 "SCEP",
+			Name:                 "scep",
+			DecrypterCertificate: certPEM,
+			DecrypterKeyPEM:      keyPEMNoPassword,
+			SignerCertificate:    ecSignerCertPEM,
+			SignerKeyPEM:         ecSignerKeyPEM,
+		}, args{Config{Claims: globalProvisionerClaims}}, false},
+		{"fail signer key and uri", &SCEP{
+			Type:              "SCEP",
+			Name:              "scep",
+			SignerCertificate: signerCertPEM,
+			SignerKeyPEM:      signerKeyPEM,
+			SignerKeyURI:      "softkms:path=" + signerPath,
+			SignerKeyPassword: "password",
+		}, args{Config{Claims: globalProvisionerClaims}}, true},
+		{"fail signer certificate without key", &SCEP{
+			Type:              "SCEP",
+			Name:              "scep",
+			SignerCertificate: signerCertPEM,
+		}, args{Config{Claims: globalProvisionerClaims}}, true},
+		{"fail signer key without certificate", &SCEP{
+			Type:              "SCEP",
+			Name:              "scep",
+			SignerKeyPEM:      signerKeyPEM,
+			SignerKeyPassword: "password",
+		}, args{Config{Claims: globalProvisionerClaims}}, true},
+		{"fail signer certificate decode", &SCEP{
+			Type:              "SCEP",
+			Name:              "scep",
+			SignerCertificate: []byte("not a pem"),
+			SignerKeyPEM:      signerKeyPEM,
+			SignerKeyPassword: "password",
+		}, args{Config{Claims: globalProvisionerClaims}}, true},
+		{"fail signer certificate with intermediate", &SCEP{
+			Type:              "SCEP",
+			Name:              "scep",
+			SignerCertificate: append(append([]byte{}, signerCertPEM...), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Intermediate.Raw})...),
+			SignerKeyPEM:      signerKeyPEM,
+			SignerKeyPassword: "password",
+		}, args{Config{Claims: globalProvisionerClaims}}, true},
+		{"fail signer key decode", &SCEP{
+			Type:              "SCEP",
+			Name:              "scep",
+			SignerCertificate: signerCertPEM,
+			SignerKeyPEM:      []byte("not a pem"),
+		}, args{Config{Claims: globalProvisionerClaims}}, true},
+		{"fail signer password", &SCEP{
+			Type:              "SCEP",
+			Name:              "scep",
+			SignerCertificate: signerCertPEM,
+			SignerKeyPEM:      signerKeyPEM,
+			SignerKeyPassword: "badpassword",
+		}, args{Config{Claims: globalProvisionerClaims}}, true},
+		{"fail signer uri", &SCEP{
+			Type:              "SCEP",
+			Name:              "scep",
+			SignerCertificate: signerCertPEM,
+			SignerKeyURI:      "softkms:path=missing.key",
+		}, args{Config{Claims: globalProvisionerClaims}}, true},
+		{"fail signer uri type", &SCEP{
+			Type:              "SCEP",
+			Name:              "scep",
+			SignerCertificate: signerCertPEM,
+			SignerKeyURI:      "foo:path=" + signerPath,
+		}, args{Config{Claims: globalProvisionerClaims}}, true},
+		{"fail signer key match", &SCEP{
+			Type:              "SCEP",
+			Name:              "scep",
+			SignerCertificate: signerCertPEM,
+			SignerKeyPEM:      keyPEM,
+			SignerKeyPassword: "password",
+		}, args{Config{Claims: globalProvisionerClaims}}, true},
 		{"fail type", &SCEP{
 			Type:                          "",
 			Name:                          "scep",
@@ -766,6 +901,67 @@ func TestSCEP_Init(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSCEP_Init_signer(t *testing.T) {
+	ca, err := minica.New()
+	require.NoError(t, err)
+
+	newKeyPair := func(cn string) (*x509.Certificate, []byte, []byte) {
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+		cert, err := ca.Sign(&x509.Certificate{
+			Subject:   pkix.Name{CommonName: cn},
+			PublicKey: key.Public(),
+		})
+		require.NoError(t, err)
+		return cert,
+			pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw}),
+			pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	}
+	decrypterCert, decrypterCertPEM, decrypterKeyPEM := newKeyPair("SCEP decrypter")
+	signerCert, signerCertPEM, signerKeyPEM := newKeyPair("SCEP signer")
+
+	t.Run("decrypter signs without separate signer", func(t *testing.T) {
+		p := &SCEP{
+			Type:                 "SCEP",
+			Name:                 "scep",
+			DecrypterCertificate: decrypterCertPEM,
+			DecrypterKeyPEM:      decrypterKeyPEM,
+		}
+		require.NoError(t, p.Init(Config{Claims: globalProvisionerClaims}))
+		cert, signer := p.GetSigner()
+		assert.Equal(t, decrypterCert, cert)
+		require.NotNil(t, signer)
+		assert.True(t, decrypterCert.PublicKey.(*rsa.PublicKey).Equal(signer.Public()))
+	})
+
+	t.Run("separate signer replaces decrypter", func(t *testing.T) {
+		p := &SCEP{
+			Type:                 "SCEP",
+			Name:                 "scep",
+			DecrypterCertificate: decrypterCertPEM,
+			DecrypterKeyPEM:      decrypterKeyPEM,
+			SignerCertificate:    signerCertPEM,
+			SignerKeyPEM:         signerKeyPEM,
+		}
+		require.NoError(t, p.Init(Config{Claims: globalProvisionerClaims}))
+		cert, decrypter := p.GetDecrypter()
+		assert.Equal(t, decrypterCert, cert)
+		assert.True(t, decrypterCert.PublicKey.(*rsa.PublicKey).Equal(decrypter.Public()))
+		cert, signer := p.GetSigner()
+		assert.Equal(t, signerCert, cert)
+		require.NotNil(t, signer)
+		assert.True(t, signerCert.PublicKey.(*rsa.PublicKey).Equal(signer.Public()))
+	})
+
+	t.Run("no decrypter and no signer", func(t *testing.T) {
+		p := &SCEP{Type: "SCEP", Name: "scep"}
+		require.NoError(t, p.Init(Config{Claims: globalProvisionerClaims}))
+		cert, signer := p.GetSigner()
+		assert.Nil(t, cert)
+		assert.Nil(t, signer)
+	})
 }
 
 func TestSCEP_Getters(t *testing.T) {
